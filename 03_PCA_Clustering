@@ -1,0 +1,106 @@
+    ggplot2::theme_classic(base_size = 12) +
+    ggplot2::theme(legend.position = "none",
+      axis.text.x = ggplot2::element_text(angle = 35, hjust = 1, size = 9.5),
+      plot.tag = ggplot2::element_text(face = "bold", size = 14))
+}
+boxes <- lapply(1:5, make_biomarker_box)
+supp_biomarkers <- patchwork::wrap_plots(boxes, nrow = 1)
+print(supp_biomarkers)
+save_plot(supp_biomarkers, "Supplementary_Biomarker_Distributions", 13, 4.8)
+
+# 7. SUPPLEMENTARY | PRIOR INFECTION HISTORY (OPTIONAL) ------
+# Only runs if the separately approved history dataset is present.
+if (file.exists(history_file)) {
+  history <- readxl::read_excel(history_file) |>
+    janitor::clean_names()
+  needed_history <- c("subject_id", "patient_status_1y")
+  if (!all(needed_history %in% names(history))) {
+    stop("History file must contain Subject ID and Patient Status 1Y.")
+  }
+  history <- history |>
+    dplyr::transmute(
+      subject_id = as.character(subject_id),
+      patient_status_1y = as.character(patient_status_1y)
+    ) |>
+    dplyr::mutate(
+      n_asymptomatic = stringr::str_count(patient_status_1y, "A"),
+      n_symptomatic = stringr::str_count(patient_status_1y, "S"),
+      infection_history = dplyr::case_when(
+        is.na(patient_status_1y) ~ NA_character_,
+        n_asymptomatic == 0 & n_symptomatic == 0 ~ "Vaccination only",
+        n_asymptomatic == 1 & n_symptomatic == 0 ~ "1 asymptomatic infection",
+        n_asymptomatic >= 2 & n_symptomatic == 0 ~ "≥2 asymptomatic infections",
+        n_asymptomatic == 0 & n_symptomatic == 1 ~ "1 symptomatic infection",
+        n_asymptomatic == 0 & n_symptomatic >= 2 ~ "≥2 symptomatic infections",
+        n_asymptomatic >= 1 & n_symptomatic >= 1 ~
+          "Both asymptomatic + symptomatic infections",
+        TRUE ~ NA_character_
+      )
+    )
+  if (anyDuplicated(history$subject_id)) stop("Duplicate IDs in history file.")
+  history_levels <- c("Vaccination only", "1 asymptomatic infection",
+    "≥2 asymptomatic infections", "1 symptomatic infection",
+    "≥2 symptomatic infections", "Both asymptomatic + symptomatic infections")
+  history_colors <- c(
+    "Vaccination only" = "#D9E6EA",
+    "1 asymptomatic infection" = "#A8D1CF",
+    "≥2 asymptomatic infections" = "#5FA8A5",
+    "1 symptomatic infection" = "#D9B8D5",
+    "≥2 symptomatic infections" = "#A66AA2",
+    "Both asymptomatic + symptomatic infections" = "#6E557A"
+  )
+  history_data <- cluster_data |>
+    dplyr::select(subject_id, cluster) |>
+    dplyr::left_join(history, by = "subject_id") |>
+    dplyr::mutate(infection_history = factor(infection_history,
+                                            levels = history_levels))
+  missing_n <- sum(is.na(history_data$infection_history))
+  if (missing_n) message("Missing Y1 infection history for ", missing_n,
+                         " participants; excluded from history chart.")
+  history_summary <- history_data |>
+    dplyr::filter(!is.na(infection_history)) |>
+    dplyr::count(cluster, infection_history, .drop = FALSE) |>
+    dplyr::group_by(cluster) |>
+    dplyr::mutate(total = sum(n), percent = 100 * n / total) |>
+    dplyr::ungroup()
+  utils::write.csv(history_summary,
+    file.path(table_dir, "Supplementary_Y1_Infection_History.csv"),
+    row.names = FALSE)
+  history_fig <- ggplot2::ggplot(history_summary,
+      ggplot2::aes(x = cluster, y = percent, fill = infection_history)) +
+    ggplot2::geom_col(width = 0.64, color = "white", linewidth = 0.8) +
+    ggplot2::geom_text(ggplot2::aes(
+      label = ifelse(percent >= 5, sprintf("%.1f%%", percent), "")),
+      position = ggplot2::position_stack(vjust = 0.5), size = 3.5) +
+    ggplot2::scale_fill_manual(values = history_colors, drop = FALSE) +
+    ggplot2::scale_y_continuous(limits = c(0, 100),
+      breaks = seq(0, 100, 20), labels = function(x) paste0(x, "%"),
+      expand = ggplot2::expansion(mult = c(0, 0))) +
+    ggplot2::labs(x = NULL, y = "Children within cluster (%)",
+                  fill = "Infection history by Year 1") +
+    ggplot2::theme_classic(base_size = 13)
+  print(history_fig)
+  save_plot(history_fig, "Supplementary_Y1_Infection_History", 11, 6)
+  history_table <- table(history_data$cluster, history_data$infection_history)
+  history_table <- history_table[rowSums(history_table) > 0,
+                                 colSums(history_table) > 0, drop = FALSE]
+  if (nrow(history_table) >= 2 && ncol(history_table) >= 2) {
+    set.seed(123)
+    history_fisher <- stats::fisher.test(history_table,
+                                         simulate.p.value = TRUE, B = 100000)
+    print(history_fisher)
+    utils::write.csv(data.frame(test = "Fisher Monte Carlo",
+      p_value = history_fisher$p.value, simulations = 100000),
+      file.path(table_dir, "Supplementary_History_Fisher.csv"), row.names = FALSE)
+  } else {
+    warning("Some clusters/history categories are empty; Fisher test skipped.")
+  }
+} else {
+  message("Optional Y1 history file not found; history figure skipped.")
+}
+
+# 8. SESSION INFORMATION -------------------------------------
+writeLines(utils::capture.output(sessionInfo()),
+           file.path(table_dir, "R_session_info_3.txt"))
+message("Analyses complete. Figures: ", figure_dir,
+        " | Result tables: ", table_dir)
