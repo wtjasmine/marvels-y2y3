@@ -1,0 +1,32 @@
+    grepl("boost", x) & grepl("covid", x) ~ NA_character_,
+    grepl("boost", x) ~ "Booster",
+    grepl("covid", x) ~ "COVID",
+    TRUE ~ NA_character_
+  )
+}
+
+# 0B. LOAD AND VALIDATE DATA ----------------------------------
+raw <- readxl::read_excel(input_file) |> janitor::clean_names()
+measurement_cols <- paste0(biomarkers$base, "_y", 1:2) if FALSE else unlist(lapply(1:2, function(year) paste0(biomarkers$base, "_y", year)))
+required_cols <- c("subject_id", "study5_y2_events", measurement_cols)
+missing_cols <- setdiff(required_cols, names(raw))
+if (length(missing_cols)) {
+  stop("Missing columns: ", paste(missing_cols, collapse = ", "))
+}
+
+dat <- raw |>
+  dplyr::mutate(
+    subject_id = as.character(subject_id),
+    dplyr::across(dplyr::all_of(measurement_cols),
+      ~ clean_biomarker(.x, substitute_negative =
+          dplyr::cur_column() %in% paste0("anti_s_ig_a_y", 1:3)))
+  )
+dat$event_y2 <- clean_event(dat$study5_y2_events)
+if (anyDuplicated(dat$subject_id)) stop("Duplicate subject IDs; resolve before analysis.")
+
+# 1. FIGURE 2 | LONGITUDINAL CHANGES -------------------------
+# Y1-to-Y2 comparisons in children with no intervening events.
+# Separate paired complete-case samples are used for each biomarker.
+paired_dataset <- function(data, base) {
+  data |>
+    dplyr::transmute(subject_id,
