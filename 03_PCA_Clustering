@@ -1,46 +1,983 @@
-    ggplot2::theme_classic(base_size = 12) +
-    ggplot2::theme(legend.position = "none",
-      axis.text.x = ggplot2::element_text(angle = 35, hjust = 1, size = 9.5),
-      plot.tag = ggplot2::element_text(face = "bold", size = 14))
-}
-boxes <- lapply(1:5, make_biomarker_box)
-supp_biomarkers <- patchwork::wrap_plots(boxes, nrow = 1)
-print(supp_biomarkers)
-save_plot(supp_biomarkers, "Supplementary_Biomarker_Distributions", 13, 4.8)
 
-# 7. SUPPLEMENTARY | PRIOR INFECTION HISTORY (OPTIONAL) ------
-# Only runs if the separately approved history dataset is present.
-if (file.exists(history_file)) {
-  history <- readxl::read_excel(history_file) |>
-    janitor::clean_names()
-  needed_history <- c("subject_id", "patient_status_1y")
-  if (!all(needed_history %in% names(history))) {
-    stop("History file must contain Subject ID and Patient Status 1Y.")
+# ============================================================
+# MARVELS: PCA AND HIERARCHICAL CLUSTERING
+# FIGURE 4 AND SUPPLEMENTARY FIGURES
+# ============================================================
+
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(janitor)
+library(stringr)
+library(plot3D)
+
+
+# ============================================================
+# 2. FILE PATHS
+# ============================================================
+
+input_file <- "data/MARVELS_longevity_immuno.xlsx"
+history_file <- "data/Patient_Immunity_at_1Y.xlsx"
+
+output_dir <- "output"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+set.seed(123)
+
+
+# ============================================================
+# 3. CLUSTER COLORS AND BIOMARKERS
+# ============================================================
+
+cluster_colors <- c(
+  "Cluster 1" = "#C76D5C",
+  "Cluster 2" = "#6A9F58",
+  "Cluster 3" = "#5B7FA3"
+)
+
+biomarkers <- c(
+  "anti_s_ig_g_y1",
+  "anti_s_ig_a_y1",
+  "ic50_y1",
+  "spike_mbc_y1",
+  "if_ng_y1"
+)
+
+biomarker_labels <- c(
+  "Anti-S IgG",
+  "Anti-S IgA",
+  "nAbs",
+  "S+ MBC",
+  "S-reactive T cell responses"
+)
+
+
+# ============================================================
+# 4. READ AND CLEAN DATA
+# ============================================================
+
+dat <- read_excel(input_file) %>%
+  clean_names()
+
+# Convert biomarkers to numeric
+for (b in biomarkers) {
+
+  x <- trimws(as.character(dat[[b]]))
+
+  if (b == "anti_s_ig_a_y1") {
+    x[x == "Negative"] <- "0.1"
   }
-  history <- history |>
-    dplyr::transmute(
-      subject_id = as.character(subject_id),
-      patient_status_1y = as.character(patient_status_1y)
-    ) |>
-    dplyr::mutate(
-      n_asymptomatic = stringr::str_count(patient_status_1y, "A"),
-      n_symptomatic = stringr::str_count(patient_status_1y, "S"),
-      infection_history = dplyr::case_when(
-        is.na(patient_status_1y) ~ NA_character_,
-        n_asymptomatic == 0 & n_symptomatic == 0 ~ "Vaccination only",
-        n_asymptomatic == 1 & n_symptomatic == 0 ~ "1 asymptomatic infection",
-        n_asymptomatic >= 2 & n_symptomatic == 0 ~ "≥2 asymptomatic infections",
-        n_asymptomatic == 0 & n_symptomatic == 1 ~ "1 symptomatic infection",
-        n_asymptomatic == 0 & n_symptomatic >= 2 ~ "≥2 symptomatic infections",
-        n_asymptomatic >= 1 & n_symptomatic >= 1 ~
-          "Both asymptomatic + symptomatic infections",
-        TRUE ~ NA_character_
+
+  dat[[b]] <- suppressWarnings(as.numeric(x))
+}
+
+dat <- dat %>%
+  mutate(
+    subject_id = as.character(subject_id),
+    study5_y2_events =
+      trimws(as.character(study5_y2_events))
+  )
+
+if (anyDuplicated(dat$subject_id)) {
+  stop("Duplicate subject IDs detected.")
+}
+
+
+# ============================================================
+# 5. SELECT ANALYSIS COHORT
+# ============================================================
+
+# Retain children with:
+# - COVID or No Events between Y1 and Y2
+# - Complete positive Y1 biomarkers
+#
+# This follows the original analysis.
+
+dat_y1 <- dat %>%
+  filter(
+    study5_y2_events %in% c("COVID", "No Events")
+  ) %>%
+  filter(
+    if_all(
+      all_of(biomarkers),
+      ~ !is.na(.x) & is.finite(.x) & .x > 0
+    )
+  ) %>%
+  select(
+    subject_id,
+    study5_y2_events,
+    all_of(biomarkers)
+  )
+
+cat("\nAnalysis cohort: N =", nrow(dat_y1), "\n")
+print(table(dat_y1$study5_y2_events))
+
+if (nrow(dat_y1) < 3) {
+  stop("Insufficient observations for clustering.")
+}
+
+
+# ============================================================
+# 6. LOG10 TRANSFORMATION AND STANDARDIZATION
+# ============================================================
+
+x_raw <- dat_y1 %>%
+  select(all_of(biomarkers))
+
+x_log <- log10(x_raw)
+
+# Z-score standardization
+x_scaled <- scale(x_log)
+
+if (any(!is.finite(x_scaled))) {
+  stop("Non-finite scaled values. Check biomarker variability.")
+}
+
+
+# ============================================================
+# 7. PRINCIPAL COMPONENT ANALYSIS
+# ============================================================
+
+pca <- prcomp(
+  x_scaled,
+  center = FALSE,
+  scale. = FALSE
+)
+
+variance <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+pca_variance <- data.frame(
+  PC = paste0("PC", seq_along(variance)),
+  Variance_percent = variance,
+  Cumulative_percent = cumsum(variance)
+)
+
+cat("\nPCA explained variance:\n")
+print(pca_variance)
+
+cat(
+  "\nVariance explained by PC1-PC3:",
+  round(sum(variance[1:3]), 2),
+  "%\n"
+)
+
+# PCA loadings
+pca_loadings <- data.frame(
+  Biomarker = biomarker_labels,
+  pca$rotation,
+  row.names = NULL
+)
+
+print(pca_loadings)
+
+write.csv(
+  pca_variance,
+  file.path(output_dir, "PCA_Variance.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  pca_loadings,
+  file.path(output_dir, "PCA_Loadings.csv"),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 8. HIERARCHICAL CLUSTERING
+# ============================================================
+
+# Retain PC1, PC2 and PC3
+pc123 <- pca$x[, 1:3, drop = FALSE]
+
+# Euclidean distance + Ward.D2
+hc <- hclust(
+  dist(pc123),
+  method = "ward.D2"
+)
+
+# Three clusters
+cluster_raw <- cutree(hc, k = 3)
+
+cat("\nRaw cluster sizes:\n")
+print(table(cluster_raw))
+
+
+# ============================================================
+# 9. CHARACTERIZE AND LABEL CLUSTERS
+# ============================================================
+
+# Cluster 1: Lowest humoral response
+# Cluster 2: Relatively IFN-gamma-associated
+# Cluster 3: Remaining broad high-response cluster
+#
+# Labels follow the original analysis.
+
+cluster_profile <- as.data.frame(x_scaled) %>%
+  mutate(cluster_raw = cluster_raw) %>%
+  group_by(cluster_raw) %>%
+  summarise(
+    across(all_of(biomarkers), mean),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    humoral_mean = rowMeans(
+      pick(
+        anti_s_ig_g_y1,
+        anti_s_ig_a_y1,
+        ic50_y1,
+        spike_mbc_y1
+      )
+    ),
+    cellular_relative = if_ng_y1 - humoral_mean
+  )
+
+# Lowest humoral response
+raw_low <- cluster_profile %>%
+  arrange(humoral_mean) %>%
+  slice(1) %>%
+  pull(cluster_raw)
+
+# Highest relative cellular response among remaining
+raw_cellular <- cluster_profile %>%
+  filter(cluster_raw != raw_low) %>%
+  arrange(desc(cellular_relative)) %>%
+  slice(1) %>%
+  pull(cluster_raw)
+
+# Remaining cluster
+raw_high <- setdiff(
+  unique(cluster_raw),
+  c(raw_low, raw_cellular)
+)
+
+# Map raw IDs to final names
+cluster_map <- setNames(
+  c("Cluster 1", "Cluster 2", "Cluster 3"),
+  as.character(c(raw_low, raw_cellular, raw_high))
+)
+
+dat_y1$cluster_raw <- cluster_raw
+
+dat_y1$cluster <- factor(
+  unname(cluster_map[as.character(cluster_raw)]),
+  levels = names(cluster_colors)
+)
+
+cat("\nFinal cluster sizes:\n")
+print(table(dat_y1$cluster))
+
+write.csv(
+  cluster_profile,
+  file.path(output_dir, "Cluster_Profiles.csv"),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 10. STANDARDIZED IMMUNE PROFILES
+# ============================================================
+
+profile_long <- as.data.frame(x_scaled) %>%
+  mutate(
+    cluster = dat_y1$cluster
+  ) %>%
+  pivot_longer(
+    cols = all_of(biomarkers),
+    names_to = "biomarker",
+    values_to = "z_value"
+  ) %>%
+  mutate(
+    biomarker = factor(
+      biomarker,
+      levels = biomarkers,
+      labels = biomarker_labels
+    )
+  )
+
+profile_means <- profile_long %>%
+  group_by(cluster, biomarker) %>%
+  summarise(
+    mean_z = mean(z_value),
+    .groups = "drop"
+  )
+
+write.csv(
+  profile_means,
+  file.path(output_dir, "Standardized_Cluster_Means.csv"),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 11. FIGURE 4A: STANDARDIZED IMMUNE PROFILES
+# ============================================================
+
+p_profile <- ggplot() +
+
+  geom_hline(
+    yintercept = 0,
+    linetype = "dashed",
+    color = "grey55"
+  ) +
+
+  # Individual observations
+  geom_point(
+    data = profile_long,
+    aes(
+      x = biomarker,
+      y = z_value,
+      color = cluster
+    ),
+    alpha = 0.18,
+    size = 1.9,
+    position = position_jitter(
+      width = 0.06,
+      height = 0,
+      seed = 123
+    )
+  ) +
+
+  # Cluster means
+  geom_point(
+    data = profile_means,
+    aes(
+      x = biomarker,
+      y = mean_z,
+      color = cluster
+    ),
+    size = 5.5
+  ) +
+
+  scale_color_manual(values = cluster_colors) +
+
+  labs(
+    title = "A",
+    x = NULL,
+    y = expression(
+      "Standardized log"[10] * " biomarker level"
+    ),
+    color = NULL
+  ) +
+
+  theme_classic(base_size = 13) +
+
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "top",
+    axis.text.x = element_text(
+      angle = 25,
+      hjust = 1,
+      size = 11
+    )
+  )
+
+
+# ============================================================
+# 12. SUBSEQUENT SARS-CoV-2 INFECTION
+# ============================================================
+
+infection_summary <- dat_y1 %>%
+  group_by(cluster) %>%
+  summarise(
+    total = n(),
+    infected = sum(study5_y2_events == "COVID"),
+    no_event = sum(study5_y2_events == "No Events"),
+    percent = 100 * infected / total,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = paste0(
+      infected, "/", total, "\n",
+      sprintf("%.1f%%", percent)
+    )
+  )
+
+cat("\nSubsequent infection by cluster:\n")
+print(infection_summary)
+
+write.csv(
+  infection_summary,
+  file.path(output_dir, "Infection_by_Cluster.csv"),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 13. FISHER'S EXACT TEST
+# ============================================================
+
+infection_table <- table(
+  dat_y1$cluster,
+  dat_y1$study5_y2_events
+)
+
+fisher_result <- fisher.test(infection_table)
+
+cat("\nFisher's exact test:\n")
+print(fisher_result)
+
+write.csv(
+  data.frame(p_value = fisher_result$p.value),
+  file.path(output_dir, "Cluster_Infection_Fisher.csv"),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 14. FIGURE 4B: INFECTION BY CLUSTER
+# ============================================================
+
+p_infection <- ggplot(
+  infection_summary,
+  aes(
+    x = cluster,
+    y = percent,
+    fill = cluster
+  )
+) +
+
+  geom_col(
+    width = 0.6,
+    alpha = 0.92
+  ) +
+
+  geom_text(
+    aes(label = label),
+    vjust = -0.45,
+    size = 4,
+    lineheight = 0.9
+  ) +
+
+  scale_fill_manual(values = cluster_colors) +
+
+  scale_y_continuous(
+    breaks = seq(0, 100, 20),
+    labels = function(x) paste0(x, "%")
+  ) +
+
+  coord_cartesian(ylim = c(0, 110)) +
+
+  labs(
+    title = "B",
+    x = NULL,
+    y = "Subsequent SARS-CoV-2 infection"
+  ) +
+
+  theme_classic(base_size = 13) +
+
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    legend.position = "none"
+  )
+
+
+# ============================================================
+# 15. COMBINE FIGURE 4
+# ============================================================
+
+figure4 <- (
+  p_profile |
+    plot_spacer() |
+    p_infection
+) +
+  plot_layout(widths = c(2.1, 0.06, 1))
+
+print(figure4)
+
+ggsave(
+  file.path(output_dir, "Figure4.pdf"),
+  figure4,
+  width = 12,
+  height = 5.5
+)
+
+ggsave(
+  file.path(output_dir, "Figure4.png"),
+  figure4,
+  width = 12,
+  height = 5.5,
+  dpi = 600
+)
+
+
+# ============================================================
+# 16. SUPPLEMENTARY FIGURE S1: DENDROGRAM
+# ============================================================
+
+plot_dendrogram <- function() {
+
+  par(mar = c(4, 5, 1, 1), xpd = NA)
+
+  plot(
+    hc,
+    labels = FALSE,
+    hang = -1,
+    main = "",
+    xlab = "",
+    sub = "",
+    ylab = "Ward.D2 linkage height"
+  )
+
+  # Raw cluster order from left to right
+  ordered_clusters <- cluster_raw[hc$order]
+  raw_order <- unique(ordered_clusters)
+
+  # Convert raw cluster IDs to final names
+  final_order <- unname(
+    cluster_map[as.character(raw_order)]
+  )
+
+  # Draw colored cluster rectangles
+  rect.hclust(
+    hc,
+    k = 3,
+    border = cluster_colors[final_order]
+  )
+
+  # Cluster label positions
+  centres <- sapply(
+    raw_order,
+    function(k) mean(which(ordered_clusters == k))
+  )
+
+  # Place labels below the dendrogram
+  y_position <- par("usr")[3] -
+    0.03 * diff(par("usr")[3:4])
+
+  text(
+    x = centres,
+    y = y_position,
+    labels = final_order,
+    col = cluster_colors[final_order],
+    font = 2,
+    cex = 1.05
+  )
+}
+
+pdf(
+  file.path(output_dir, "Supplementary_Figure_S1.pdf"),
+  width = 8,
+  height = 5
+)
+
+plot_dendrogram()
+dev.off()
+
+png(
+  file.path(output_dir, "Supplementary_Figure_S1.png"),
+  width = 8,
+  height = 5,
+  units = "in",
+  res = 600
+)
+
+plot_dendrogram()
+dev.off()
+
+
+# ============================================================
+# 17. SUPPLEMENTARY FIGURE S2: PCA VISUALIZATION
+# ============================================================
+
+pc_df <- as.data.frame(pc123) %>%
+  mutate(
+    cluster = dat_y1$cluster
+  )
+
+# ------------------------------------------------------------
+# A. Three-dimensional PCA
+# ------------------------------------------------------------
+
+plot_pca_3d <- function() {
+
+  scatter3D(
+    x = pc_df$PC1,
+    y = pc_df$PC2,
+    z = pc_df$PC3,
+
+    colvar = NULL,
+    col = cluster_colors[as.character(pc_df$cluster)],
+
+    pch = 19,
+    cex = 1.5,
+
+    xlab = paste0("PC1 (", round(variance[1], 1), "%)"),
+    ylab = paste0("PC2 (", round(variance[2], 1), "%)"),
+    zlab = paste0("PC3 (", round(variance[3], 1), "%)"),
+
+    theta = 42,
+    phi = 25,
+    ticktype = "detailed",
+    bty = "g",
+    colkey = FALSE
+  )
+}
+
+pdf(
+  file.path(output_dir, "Supplementary_PCA_3D.pdf"),
+  width = 8,
+  height = 7
+)
+
+plot_pca_3d()
+dev.off()
+
+png(
+  file.path(output_dir, "Supplementary_PCA_3D.png"),
+  width = 8,
+  height = 7,
+  units = "in",
+  res = 600
+)
+
+plot_pca_3d()
+dev.off()
+
+
+# ------------------------------------------------------------
+# B. Two-dimensional PCA projections
+# ------------------------------------------------------------
+
+make_pca_plot <- function(x, y) {
+
+  x_id <- as.integer(sub("PC", "", x))
+  y_id <- as.integer(sub("PC", "", y))
+
+  ggplot(
+    pc_df,
+    aes(
+      x = .data[[x]],
+      y = .data[[y]],
+      color = cluster
+    )
+  ) +
+
+    geom_point(size = 3, alpha = 0.85) +
+
+    scale_color_manual(values = cluster_colors) +
+
+    labs(
+      x = paste0(x, " (", round(variance[x_id], 1), "%)"),
+      y = paste0(y, " (", round(variance[y_id], 1), "%)"),
+      color = NULL
+    ) +
+
+    theme_classic(base_size = 12)
+}
+
+p_pc12 <- make_pca_plot("PC1", "PC2")
+p_pc13 <- make_pca_plot("PC1", "PC3")
+p_pc23 <- make_pca_plot("PC2", "PC3")
+
+pca_2d <- (
+  p_pc12 | p_pc13 | p_pc23
+) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "top")
+
+print(pca_2d)
+
+ggsave(
+  file.path(output_dir, "Supplementary_PCA_2D.pdf"),
+  pca_2d,
+  width = 12,
+  height = 4.8
+)
+
+ggsave(
+  file.path(output_dir, "Supplementary_PCA_2D.png"),
+  pca_2d,
+  width = 12,
+  height = 4.8,
+  dpi = 600
+)
+
+
+# ============================================================
+# 18. SUPPLEMENTARY FIGURE S3: BIOMARKER DISTRIBUTIONS
+# ============================================================
+
+biomarker_long <- dat_y1 %>%
+  select(cluster, all_of(biomarkers)) %>%
+  pivot_longer(
+    cols = all_of(biomarkers),
+    names_to = "biomarker",
+    values_to = "value"
+  ) %>%
+  mutate(
+    biomarker = factor(
+      biomarker,
+      levels = biomarkers,
+      labels = biomarker_labels
+    )
+  )
+
+
+# ============================================================
+# 19. FUNCTION: BIOMARKER BOXPLOT
+# ============================================================
+
+make_boxplot <- function(
+    name,
+    y_label,
+    panel,
+    breaks,
+    limits
+) {
+
+  ggplot(
+    biomarker_long %>% filter(biomarker == name),
+    aes(x = cluster, y = value, color = cluster)
+  ) +
+
+    geom_boxplot(
+      width = 0.55,
+      outlier.shape = NA,
+      linewidth = 0.75
+    ) +
+
+    geom_jitter(
+      width = 0.1,
+      height = 0,
+      size = 2,
+      alpha = 0.55
+    ) +
+
+    scale_y_log10(breaks = breaks) +
+
+    coord_cartesian(ylim = limits) +
+
+    scale_color_manual(values = cluster_colors) +
+
+    labs(
+      tag = panel,
+      x = NULL,
+      y = y_label
+    ) +
+
+    theme_classic(base_size = 12) +
+
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(
+        angle = 35,
+        hjust = 1,
+        size = 9.5
+      ),
+      plot.tag = element_text(
+        face = "bold",
+        size = 14
       )
     )
-  if (anyDuplicated(history$subject_id)) stop("Duplicate IDs in history file.")
-  history_levels <- c("Vaccination only", "1 asymptomatic infection",
-    "≥2 asymptomatic infections", "1 symptomatic infection",
-    "≥2 symptomatic infections", "Both asymptomatic + symptomatic infections")
+}
+
+
+# ============================================================
+# 20. CREATE FIVE BIOMARKER PANELS
+# ============================================================
+
+p_igg <- make_boxplot(
+  "Anti-S IgG", "U/mL", "A",
+  c(1, 3, 10, 30, 100, 300, 1000),
+  c(1, 1000)
+)
+
+p_iga <- make_boxplot(
+  "Anti-S IgA", "U/mL", "B",
+  c(0.1, 0.3, 1, 3, 10),
+  c(0.1, 10)
+)
+
+p_nabs <- make_boxplot(
+  "nAbs", "sVNT50", "C",
+  c(10, 30, 100, 300, 1000, 3000, 10000),
+  c(10, 10000)
+)
+
+p_mbc <- make_boxplot(
+  "S+ MBC", "% of total B cells", "D",
+  c(0.01, 0.03, 0.1, 0.3, 1),
+  c(0.01, 1)
+)
+
+p_ifng <- make_boxplot(
+  "S-reactive T cell responses",
+  "IFN-γ (pg/mL)",
+  "E",
+  c(1, 3, 10, 30, 100, 300, 1000),
+  c(1, 1000)
+)
+
+
+# ============================================================
+# 21. COMBINE SUPPLEMENTARY FIGURE S3
+# ============================================================
+
+supp_biomarkers <- (
+  p_igg |
+    p_iga |
+    p_nabs |
+    p_mbc |
+    p_ifng
+)
+
+print(supp_biomarkers)
+
+ggsave(
+  file.path(output_dir, "Supplementary_Figure_S3.pdf"),
+  supp_biomarkers,
+  width = 13,
+  height = 4.8
+)
+
+ggsave(
+  file.path(output_dir, "Supplementary_Figure_S3.png"),
+  supp_biomarkers,
+  width = 13,
+  height = 4.8,
+  dpi = 600
+)
+
+
+# ============================================================
+# 22. SUPPLEMENTARY FIGURE S4: PRIOR INFECTION HISTORY
+# ============================================================
+
+# Requires the separate Year 1 infection-history dataset.
+
+if (file.exists(history_file)) {
+
+  # ----------------------------------------------------------
+  # Read history data
+  # ----------------------------------------------------------
+
+  history <- read_excel(history_file) %>%
+    clean_names() %>%
+    select(subject_id, patient_status_1y) %>%
+    mutate(
+      subject_id = as.character(subject_id),
+      patient_status_1y =
+        trimws(as.character(patient_status_1y))
+    )
+
+  if (anyDuplicated(history$subject_id)) {
+    stop("Duplicate subject IDs in infection-history data.")
+  }
+
+  # ----------------------------------------------------------
+  # Count prior infection episodes
+  # ----------------------------------------------------------
+
+  # A = asymptomatic infection
+  # S = symptomatic infection
+  # V = vaccination
+
+  history <- history %>%
+    mutate(
+      n_asymptomatic = str_count(patient_status_1y, "A"),
+      n_symptomatic = str_count(patient_status_1y, "S")
+    )
+
+  # ----------------------------------------------------------
+  # Classify prior infection history
+  # ----------------------------------------------------------
+
+  history_levels <- c(
+    "Vaccination only",
+    "1 asymptomatic infection",
+    "≥2 asymptomatic infections",
+    "1 symptomatic infection",
+    "≥2 symptomatic infections",
+    "Both asymptomatic + symptomatic infections"
+  )
+
+  history <- history %>%
+    mutate(
+      infection_history = case_when(
+        is.na(patient_status_1y) ~ NA_character_,
+
+        n_asymptomatic == 0 & n_symptomatic == 0 ~
+          "Vaccination only",
+
+        n_asymptomatic == 1 & n_symptomatic == 0 ~
+          "1 asymptomatic infection",
+
+        n_asymptomatic >= 2 & n_symptomatic == 0 ~
+          "≥2 asymptomatic infections",
+
+        n_asymptomatic == 0 & n_symptomatic == 1 ~
+          "1 symptomatic infection",
+
+        n_asymptomatic == 0 & n_symptomatic >= 2 ~
+          "≥2 symptomatic infections",
+
+        n_asymptomatic >= 1 & n_symptomatic >= 1 ~
+          "Both asymptomatic + symptomatic infections"
+      ),
+
+      infection_history = factor(
+        infection_history,
+        levels = history_levels
+      )
+    )
+
+  # ----------------------------------------------------------
+  # Merge with cluster assignments
+  # ----------------------------------------------------------
+
+  history_data <- dat_y1 %>%
+    select(subject_id, cluster) %>%
+    left_join(
+      history %>%
+        select(subject_id, infection_history),
+      by = "subject_id"
+    )
+
+  cat("\nPrior infection history by cluster:\n")
+
+  print(
+    table(
+      history_data$cluster,
+      history_data$infection_history,
+      useNA = "ifany"
+    )
+  )
+
+  # ----------------------------------------------------------
+  # Calculate percentages within each cluster
+  # ----------------------------------------------------------
+
+  history_summary <- history_data %>%
+    filter(!is.na(infection_history)) %>%
+    count(
+      cluster,
+      infection_history,
+      .drop = FALSE
+    ) %>%
+    group_by(cluster) %>%
+    mutate(
+      total = sum(n),
+      percent = ifelse(total > 0, 100 * n / total, 0)
+    ) %>%
+    ungroup()
+
+  write.csv(
+    history_summary,
+    file.path(output_dir, "Y1_Infection_History.csv"),
+    row.names = FALSE
+  )
+
+  # ----------------------------------------------------------
+  # Infection-history colors
+  # ----------------------------------------------------------
+
   history_colors <- c(
     "Vaccination only" = "#D9E6EA",
     "1 asymptomatic infection" = "#A8D1CF",
@@ -49,58 +986,163 @@ if (file.exists(history_file)) {
     "≥2 symptomatic infections" = "#A66AA2",
     "Both asymptomatic + symptomatic infections" = "#6E557A"
   )
-  history_data <- cluster_data |>
-    dplyr::select(subject_id, cluster) |>
-    dplyr::left_join(history, by = "subject_id") |>
-    dplyr::mutate(infection_history = factor(infection_history,
-                                            levels = history_levels))
-  missing_n <- sum(is.na(history_data$infection_history))
-  if (missing_n) message("Missing Y1 infection history for ", missing_n,
-                         " participants; excluded from history chart.")
-  history_summary <- history_data |>
-    dplyr::filter(!is.na(infection_history)) |>
-    dplyr::count(cluster, infection_history, .drop = FALSE) |>
-    dplyr::group_by(cluster) |>
-    dplyr::mutate(total = sum(n), percent = 100 * n / total) |>
-    dplyr::ungroup()
-  utils::write.csv(history_summary,
-    file.path(table_dir, "Supplementary_Y1_Infection_History.csv"),
-    row.names = FALSE)
-  history_fig <- ggplot2::ggplot(history_summary,
-      ggplot2::aes(x = cluster, y = percent, fill = infection_history)) +
-    ggplot2::geom_col(width = 0.64, color = "white", linewidth = 0.8) +
-    ggplot2::geom_text(ggplot2::aes(
-      label = ifelse(percent >= 5, sprintf("%.1f%%", percent), "")),
-      position = ggplot2::position_stack(vjust = 0.5), size = 3.5) +
-    ggplot2::scale_fill_manual(values = history_colors, drop = FALSE) +
-    ggplot2::scale_y_continuous(limits = c(0, 100),
-      breaks = seq(0, 100, 20), labels = function(x) paste0(x, "%"),
-      expand = ggplot2::expansion(mult = c(0, 0))) +
-    ggplot2::labs(x = NULL, y = "Children within cluster (%)",
-                  fill = "Infection history by Year 1") +
-    ggplot2::theme_classic(base_size = 13)
-  print(history_fig)
-  save_plot(history_fig, "Supplementary_Y1_Infection_History", 11, 6)
-  history_table <- table(history_data$cluster, history_data$infection_history)
-  history_table <- history_table[rowSums(history_table) > 0,
-                                 colSums(history_table) > 0, drop = FALSE]
-  if (nrow(history_table) >= 2 && ncol(history_table) >= 2) {
+
+  # ----------------------------------------------------------
+  # Figure S4: Stacked bar chart
+  # ----------------------------------------------------------
+
+  p_history <- ggplot(
+    history_summary,
+    aes(
+      x = cluster,
+      y = percent,
+      fill = infection_history
+    )
+  ) +
+
+    geom_col(
+      width = 0.64,
+      color = "white",
+      linewidth = 0.8
+    ) +
+
+    geom_text(
+      aes(
+        label = ifelse(
+          percent >= 5,
+          sprintf("%.1f%%", percent),
+          ""
+        )
+      ),
+      position = position_stack(vjust = 0.5),
+      size = 3.5
+    ) +
+
+    scale_fill_manual(
+      values = history_colors,
+      drop = FALSE
+    ) +
+
+    scale_y_continuous(
+      limits = c(0, 100),
+      breaks = seq(0, 100, 20),
+      labels = function(x) paste0(x, "%"),
+      expand = expansion(mult = c(0, 0))
+    ) +
+
+    labs(
+      x = NULL,
+      y = "Children within cluster (%)",
+      fill = "Infection history by Year 1"
+    ) +
+
+    theme_classic(base_size = 13) +
+
+    theme(
+      axis.text.x = element_text(size = 12),
+      legend.position = "right",
+      legend.title = element_text(face = "bold")
+    )
+
+  print(p_history)
+
+  ggsave(
+    file.path(output_dir, "Supplementary_Figure_S4.pdf"),
+    p_history,
+    width = 11,
+    height = 6
+  )
+
+  ggsave(
+    file.path(output_dir, "Supplementary_Figure_S4.png"),
+    p_history,
+    width = 11,
+    height = 6,
+    dpi = 600
+  )
+
+  # ----------------------------------------------------------
+  # Fisher's exact test
+  # ----------------------------------------------------------
+
+  history_table <- table(
+    history_data$cluster,
+    history_data$infection_history
+  )
+
+  # Remove empty rows and columns
+  history_table <- history_table[
+    rowSums(history_table) > 0,
+    colSums(history_table) > 0,
+    drop = FALSE
+  ]
+
+  if (nrow(history_table) >= 2 &&
+      ncol(history_table) >= 2) {
+
     set.seed(123)
-    history_fisher <- stats::fisher.test(history_table,
-                                         simulate.p.value = TRUE, B = 100000)
+
+    history_fisher <- fisher.test(
+      history_table,
+      simulate.p.value = TRUE,
+      B = 100000
+    )
+
+    cat("\nFisher's test: prior infection history\n")
     print(history_fisher)
-    utils::write.csv(data.frame(test = "Fisher Monte Carlo",
-      p_value = history_fisher$p.value, simulations = 100000),
-      file.path(table_dir, "Supplementary_History_Fisher.csv"), row.names = FALSE)
-  } else {
-    warning("Some clusters/history categories are empty; Fisher test skipped.")
+
+    write.csv(
+      data.frame(
+        p_value = history_fisher$p.value
+      ),
+      file.path(output_dir, "History_Fisher.csv"),
+      row.names = FALSE
+    )
   }
+
 } else {
-  message("Optional Y1 history file not found; history figure skipped.")
+
+  message("History dataset not found. Figure S4 skipped.")
+
 }
 
-# 8. SESSION INFORMATION -------------------------------------
-writeLines(utils::capture.output(sessionInfo()),
-           file.path(table_dir, "R_session_info_3.txt"))
-message("Analyses complete. Figures: ", figure_dir,
-        " | Result tables: ", table_dir)
+
+# ============================================================
+# 23. SESSION INFORMATION
+# ============================================================
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(output_dir, "R_session_info.txt")
+)
+
+
+# ============================================================
+# 24. FINAL SUMMARY
+# ============================================================
+
+cat("\n========================================\n")
+cat("PCA AND CLUSTERING COMPLETED\n")
+cat("========================================\n")
+
+cat("\nTotal children:", nrow(dat_y1), "\n")
+
+cat(
+  "PC1-PC3 variance explained:",
+  round(sum(variance[1:3]), 2),
+  "%\n"
+)
+
+cat("\nCluster sizes:\n")
+print(table(dat_y1$cluster))
+
+cat("\nSubsequent infection:\n")
+print(infection_summary)
+
+cat(
+  "\nFisher's exact test p-value:",
+  fisher_result$p.value,
+  "\n"
+)
+
+cat("\nResults saved to:", output_dir, "\n")
