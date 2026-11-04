@@ -1,32 +1,428 @@
-    grepl("boost", x) & grepl("covid", x) ~ NA_character_,
-    grepl("boost", x) ~ "Booster",
-    grepl("covid", x) ~ "COVID",
-    TRUE ~ NA_character_
+
+# ============================================================
+# MARVELS: LONGITUDINAL CHANGES IN IMMUNE RESPONSES
+# FIGURE 2
+# ============================================================
+
+# ============================================================
+# 1. PACKAGES
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(patchwork)
+library(janitor)
+
+
+# ============================================================
+# 2. FILE PATHS
+# ============================================================
+
+input_file <- "data/MARVELS_longevity_immuno.xlsx"
+
+output_dir <- "output"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+
+# ============================================================
+# 3. READ AND CLEAN DATA
+# ============================================================
+
+dat <- read_excel(input_file) %>%
+  clean_names()
+
+# Biomarkers to analyse
+biomarkers <- c(
+  "anti_s_ig_g",
+  "anti_s_ig_a",
+  "ic50",
+  "spike_mbc",
+  "if_ng"
+)
+
+# Convert biomarker values to numeric
+for (b in biomarkers) {
+
+  for (year in 1:2) {
+
+    col <- paste0(b, "_y", year)
+
+    x <- as.character(dat[[col]])
+
+    # Anti-S IgA: Negative -> 0.1
+    if (b == "anti_s_ig_a") {
+      x[trimws(x) == "Negative"] <- "0.1"
+    }
+
+    dat[[col]] <- suppressWarnings(as.numeric(x))
+  }
+}
+
+# Keep children without intervening events
+dat_noevent <- dat %>%
+  filter(study5_y2_events == "No Events")
+
+cat("Number of children with no events:", nrow(dat_noevent), "\n")
+
+
+# ============================================================
+# 4. FUNCTION: PAIRED ANALYSIS AND PLOT
+# ============================================================
+
+make_paired_plot <- function(
+    data,
+    biomarker,
+    title,
+    y_label,
+    panel,
+    y_breaks
+) {
+
+  # ----------------------------------------------------------
+  # Prepare paired measurements
+  # ----------------------------------------------------------
+
+  df <- data %>%
+    transmute(
+      subject_id,
+      Y1 = .data[[paste0(biomarker, "_y1")]],
+      Y2 = .data[[paste0(biomarker, "_y2")]]
+    ) %>%
+    filter(
+      !is.na(Y1),
+      !is.na(Y2),
+      Y1 > 0,
+      Y2 > 0
+    )
+
+  n_pair <- nrow(df)
+
+  # ----------------------------------------------------------
+  # Paired Wilcoxon signed-rank test
+  # ----------------------------------------------------------
+
+  p_value <- wilcox.test(
+    df$Y2,
+    df$Y1,
+    paired = TRUE,
+    exact = FALSE
+  )$p.value
+
+  significance <- case_when(
+    p_value < 0.001 ~ "***",
+    p_value < 0.01 ~ "**",
+    p_value < 0.05 ~ "*",
+    TRUE ~ "ns"
+  )
+
+  # ----------------------------------------------------------
+  # Long format
+  # ----------------------------------------------------------
+
+  df_long <- df %>%
+    pivot_longer(
+      cols = c(Y1, Y2),
+      names_to = "year",
+      values_to = "value"
+    ) %>%
+    mutate(
+      year = factor(
+        year,
+        levels = c("Y1", "Y2"),
+        labels = c("Year 1", "Year 2")
+      )
+    )
+
+  # ----------------------------------------------------------
+  # Median and IQR
+  # ----------------------------------------------------------
+
+  summary_df <- df_long %>%
+    group_by(year) %>%
+    summarise(
+      median = median(value),
+      q1 = quantile(value, 0.25),
+      q3 = quantile(value, 0.75),
+      .groups = "drop"
+    )
+
+  # ----------------------------------------------------------
+  # Significance bracket
+  # ----------------------------------------------------------
+
+  bracket_y <- max(df_long$value) * 1.5
+  text_y <- bracket_y * 1.18
+
+  # ----------------------------------------------------------
+  # Plot
+  # ----------------------------------------------------------
+
+  p <- ggplot(
+    df_long,
+    aes(x = year, y = value)
+  ) +
+
+    # Individual trajectories
+    geom_line(
+      aes(group = subject_id),
+      color = "grey60",
+      linewidth = 0.35,
+      alpha = 0.35
+    ) +
+
+    # Individual observations
+    geom_point(
+      color = "grey50",
+      size = 1.7,
+      alpha = 0.4
+    ) +
+
+    # IQR
+    geom_errorbar(
+      data = summary_df,
+      aes(
+        x = year,
+        ymin = q1,
+        ymax = q3
+      ),
+      inherit.aes = FALSE,
+      width = 0.1,
+      linewidth = 0.85,
+      color = "black"
+    ) +
+
+    # Median line
+    geom_line(
+      data = summary_df,
+      aes(
+        x = year,
+        y = median,
+        group = 1
+      ),
+      inherit.aes = FALSE,
+      linewidth = 1.1,
+      color = "black"
+    ) +
+
+    # Median points
+    geom_point(
+      data = summary_df,
+      aes(x = year, y = median),
+      inherit.aes = FALSE,
+      size = 3.6,
+      color = "black"
+    ) +
+
+    # Significance bracket
+    annotate(
+      "segment",
+      x = 1, xend = 2,
+      y = bracket_y, yend = bracket_y,
+      linewidth = 0.55
+    ) +
+
+    annotate(
+      "segment",
+      x = 1, xend = 1,
+      y = bracket_y / 1.08,
+      yend = bracket_y,
+      linewidth = 0.55
+    ) +
+
+    annotate(
+      "segment",
+      x = 2, xend = 2,
+      y = bracket_y / 1.08,
+      yend = bracket_y,
+      linewidth = 0.55
+    ) +
+
+    # Significance label
+    annotate(
+      "text",
+      x = 1.5,
+      y = text_y,
+      label = significance,
+      size = ifelse(significance == "ns", 3.5, 4.2),
+      fontface = ifelse(significance == "ns", "plain", "bold"),
+      vjust = 0
+    ) +
+
+    scale_y_log10(
+      breaks = y_breaks,
+      labels = function(x) {
+        format(x, scientific = FALSE, trim = TRUE)
+      },
+      expand = expansion(mult = c(0.05, 0.32))
+    ) +
+
+    labs(
+      title = title,
+      x = paste0("(n = ", n_pair, ")"),
+      y = y_label,
+      tag = panel
+    ) +
+
+    theme_classic(base_size = 12) +
+
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 12
+      ),
+
+      plot.tag = element_text(
+        face = "bold",
+        size = 13
+      ),
+
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_text(size = 10),
+
+      axis.title.x = element_text(
+        size = 9.5,
+        margin = margin(t = 5)
+      ),
+
+      axis.title.y = element_text(size = 10.5),
+
+      plot.margin = margin(18, 10, 5, 5)
+    )
+
+  # ----------------------------------------------------------
+  # Statistical summary
+  # ----------------------------------------------------------
+
+  result <- data.frame(
+    Biomarker = title,
+    n = n_pair,
+
+    Y1_median = median(df$Y1),
+    Y1_Q1 = quantile(df$Y1, 0.25),
+    Y1_Q3 = quantile(df$Y1, 0.75),
+
+    Y2_median = median(df$Y2),
+    Y2_Q1 = quantile(df$Y2, 0.25),
+    Y2_Q3 = quantile(df$Y2, 0.75),
+
+    p_value = p_value,
+    row.names = NULL
+  )
+
+  list(
+    plot = p,
+    result = result
   )
 }
 
-# 0B. LOAD AND VALIDATE DATA ----------------------------------
-raw <- readxl::read_excel(input_file) |> janitor::clean_names()
-measurement_cols <- paste0(biomarkers$base, "_y", 1:2) if FALSE else unlist(lapply(1:2, function(year) paste0(biomarkers$base, "_y", year)))
-required_cols <- c("subject_id", "study5_y2_events", measurement_cols)
-missing_cols <- setdiff(required_cols, names(raw))
-if (length(missing_cols)) {
-  stop("Missing columns: ", paste(missing_cols, collapse = ", "))
-}
 
-dat <- raw |>
-  dplyr::mutate(
-    subject_id = as.character(subject_id),
-    dplyr::across(dplyr::all_of(measurement_cols),
-      ~ clean_biomarker(.x, substitute_negative =
-          dplyr::cur_column() %in% paste0("anti_s_ig_a_y", 1:3)))
+# ============================================================
+# 5. GENERATE FIVE BIOMARKER PANELS
+# ============================================================
+
+igg <- make_paired_plot(
+  dat_noevent,
+  "anti_s_ig_g",
+  "Anti-S IgG",
+  "U/mL",
+  "A",
+  c(10, 30, 100, 300)
+)
+
+iga <- make_paired_plot(
+  dat_noevent,
+  "anti_s_ig_a",
+  "Anti-S IgA",
+  "U/mL",
+  "B",
+  c(0.1, 0.3, 1, 3, 10)
+)
+
+nabs <- make_paired_plot(
+  dat_noevent,
+  "ic50",
+  "Neutralizing antibodies",
+  "sVNT50",
+  "C",
+  c(30, 100, 300, 1000, 3000)
+)
+
+mbc <- make_paired_plot(
+  dat_noevent,
+  "spike_mbc",
+  "S-specific memory B cells",
+  "% of total B cells",
+  "D",
+  c(0.01, 0.03, 0.1, 0.3)
+)
+
+ifng <- make_paired_plot(
+  dat_noevent,
+  "if_ng",
+  "S-reactive T cell responses",
+  "IFN-\u03b3 (pg/mL)",
+  "E",
+  c(3, 10, 30, 100, 300)
+)
+
+
+# ============================================================
+# 6. COMBINE FIGURE 2
+# ============================================================
+
+figure2 <- (
+  igg$plot |
+    iga$plot |
+    nabs$plot
+) /
+  (
+    mbc$plot |
+      ifng$plot |
+      plot_spacer()
   )
-dat$event_y2 <- clean_event(dat$study5_y2_events)
-if (anyDuplicated(dat$subject_id)) stop("Duplicate subject IDs; resolve before analysis.")
 
-# 1. FIGURE 2 | LONGITUDINAL CHANGES -------------------------
-# Y1-to-Y2 comparisons in children with no intervening events.
-# Separate paired complete-case samples are used for each biomarker.
-paired_dataset <- function(data, base) {
-  data |>
-    dplyr::transmute(subject_id,
+print(figure2)
+
+
+# ============================================================
+# 7. SAVE FIGURE 2
+# ============================================================
+
+ggsave(
+  file.path(output_dir, "Figure2.pdf"),
+  figure2,
+  device = cairo_pdf,
+  width = 12,
+  height = 7
+)
+
+ggsave(
+  file.path(output_dir, "Figure2.png"),
+  figure2,
+  width = 12,
+  height = 7,
+  dpi = 600
+)
+
+
+# ============================================================
+# 8. EXPORT STATISTICAL RESULTS
+# ============================================================
+
+results <- bind_rows(
+  igg$result,
+  iga$result,
+  nabs$result,
+  mbc$result,
+  ifng$result
+)
+
+print(results)
+
+write.csv(
+  results,
+  file.path(output_dir, "Figure2_Wilcoxon_Results.csv"),
+  row.names = FALSE
+)
