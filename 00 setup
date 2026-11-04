@@ -1,0 +1,101 @@
+# ============================================================
+# 00_setup.R
+# Shared packages, paths, colours and helper functions.
+# Sourced at the top of every other script:
+#   source(here::here("R", "00_setup.R"))
+#
+# Run from the project root (open the RStudio project, or put an
+# empty file called ".here" in the repo root) so here() works.
+# ============================================================
+
+# ---- Packages ----------------------------------------------
+pkgs <- c(
+  "here", "readxl", "dplyr", "tidyr", "stringr",
+  "ggplot2", "patchwork", "scales",
+  "plot3D", "png", "grid"
+)
+
+missing_pkgs <- setdiff(pkgs, rownames(installed.packages()))
+if (length(missing_pkgs) > 0) {
+  stop("Please install: ", paste(missing_pkgs, collapse = ", "))
+}
+suppressPackageStartupMessages(
+  invisible(lapply(pkgs, library, character.only = TRUE))
+)
+
+set.seed(123)
+
+
+# ---- Paths (relative to the repo root) ----------------------
+# Raw data are NOT in the repository (participant data).
+# Place the two Excel files in data/ before running.
+file_main    <- here("data", "MARVELS longevity_immuno data_20260615.xlsx")
+file_history <- here("data", "Patient Immunity at 1Y.xlsx")
+
+dir_processed <- here("data", "processed")   # git-ignored
+dir_fig       <- here("output", "figures")
+dir_tab       <- here("output", "tables")
+
+for (d in c(dir_processed, dir_fig, dir_tab)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+
+# ---- Biomarkers ---------------------------------------------
+# key         = internal short name used in the cleaned data
+# raw_prefix  = column prefix in the Excel file (suffix _Y1/_Y2/_Y3)
+biomarker_info <- data.frame(
+  key = c("igg", "iga", "nab", "mbc", "ifng"),
+  raw_prefix = c("AntiS IgG", "AntiS IgA", "IC50", "Spike+ MBC", "IFNg"),
+  label = c(
+    "Anti-S IgG", "Anti-S IgA", "Neutralizing antibodies",
+    "S-specific memory B cells", "S-reactive T cell responses"
+  ),
+  short_label = c(
+    "Anti-S IgG", "Anti-S IgA", "nAbs",
+    "S+ MBC", "S-reactive T cell responses"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Cleaned column name, e.g. bm_col("igg", 1) -> "igg_y1"
+bm_col <- function(key, year) paste0(key, "_y", year)
+
+
+# ---- Colours -------------------------------------------------
+cluster_colors <- c(
+  "Cluster 1" = "#C76D5C",   # muted terracotta
+  "Cluster 2" = "#6A9F58",   # muted olive green
+  "Cluster 3" = "#5B7FA3"    # muted steel blue
+)
+
+event_colors <- c(
+  "COVID"   = "#C43C8C",     # SARS-CoV-2 infection
+  "Booster" = "#3F7FC4"      # booster vaccination
+)
+
+
+# ---- Helpers --------------------------------------------------
+# Significance stars from a p-value
+sig_stars <- function(p, ns_label = "ns") {
+  case_when(
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    TRUE      ~ ns_label
+  )
+}
+
+# Save a ggplot as PDF (vector) and PNG (600 dpi)
+save_figure <- function(plot, name, width, height) {
+  ggsave(
+    file.path(dir_fig, paste0(name, ".pdf")),
+    plot = plot, device = cairo_pdf,
+    width = width, height = height, units = "in"
+  )
+  ggsave(
+    file.path(dir_fig, paste0(name, ".png")),
+    plot = plot, width = width, height = height,
+    units = "in", dpi = 600
+  )
+}
